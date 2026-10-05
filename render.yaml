@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: cat-directory
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "10000"
