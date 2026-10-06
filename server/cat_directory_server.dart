@@ -3,412 +3,932 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:crypto/crypto.dart' as crypto;
 import 'package:cryptography/cryptography.dart';
 
-const int serverPort = int.fromEnvironment('PORT', defaultValue: 10000);
-const int sessionTtlSeconds = 45;
+final _catIdPattern =
+    RegExp(r'^CAT-[A-Z0-9]{4}-[A-Z0-9]{4}$');
 
-final _random = Random.secure();
-final _ed25519 = Ed25519();
+final _pendingChallenges =
+    <String, _Challenge>{};
 
-final Map<WebSocket, PendingHandshake> _pending = {};
-final Map<String, CatSession> _sessions = {};
+final _online =
+    <String, _OnlineCat>{};
 
-class PendingHandshake {
-  final String nonce;
-  final DateTime createdAt;
+Future<void> main(List<String> args) async {
+  final port = int.tryParse(
+        Platform.environment['PORT'] ?? '',
+      ) ??
+      int.tryParse(
+        _argValue(args, '--port') ?? '',
+      ) ??
+      10000;
 
-  PendingHandshake(this.nonce) : createdAt = DateTime.now();
-}
-
-class CatSession {
-  final String catId;
-  final String publicKey;
-  final WebSocket socket;
-  DateTime lastSeen;
-
-  CatSession({
-    required this.catId,
-    required this.publicKey,
-    required this.socket,
-  }) : lastSeen = DateTime.now();
-}
-
-String _encode(List<int> bytes) =>
-    base64UrlEncode(bytes).replaceAll('=', '');
-
-List<int> _decode(String value) =>
-    base64Url.decode(base64Url.normalize(value));
-
-String _catIdFromPublicKey(List<int> publicKeyBytes) {
-  final digestBytes = crypto.sha256.convert(publicKeyBytes).bytes;
-
-  final firstEight = digestBytes
-      .take(8)
-      .map((b) => b.toRadixString(16).padLeft(2, '0'))
-      .join();
-
-  final number =
-      BigInt.parse(firstEight, radix: 16) % BigInt.from(100000000);
-
-  return number.toInt().toString().padLeft(8, '0');
-}
-
-void _send(WebSocket socket, Map<String, dynamic> message) {
-  try {
-    socket.add(jsonEncode(message));
-  } catch (_) {
-    // Socket is already closed.
-  }
-}
-
-void _error(WebSocket socket, String code, String message) {
-  _send(socket, {
-    'type': 'error',
-    'code': code,
-    'message': message,
-  });
-}
-
-Future<void> _handleSocket(WebSocket socket) async {
-  final challenge = _encode(List<int>.generate(32, (_) => _random.nextInt(256)));
-  _pending[socket] = PendingHandshake(challenge);
-
-  _send(socket, {
-    'type': 'challenge',
-    'nonce': challenge,
-  });
-
-  late StreamSubscription subscription;
-
-  subscription = socket.listen(
-    (raw) async {
-      try {
-        if (raw is! String) {
-          _error(socket, 'INVALID_FRAME', 'Only JSON text messages are supported.');
-          return;
-        }
-
-        if (raw.length > 1024 * 1024) {
-          _error(socket, 'MESSAGE_TOO_BIG', 'Message is too large.');
-          await socket.close(WebSocketStatus.messageTooBig);
-          return;
-        }
-
-        final decoded = jsonDecode(raw);
-        if (decoded is! Map) {
-          _error(socket, 'INVALID_JSON', 'Expected a JSON object.');
-          return;
-        }
-
-        final message = Map<String, dynamic>.from(decoded);
-        final session = _sessionForSocket(socket);
-
-        if (session == null) {
-          final type = message['type'];
-
-          if (type != 'register') {
-            _error(socket, 'NOT_REGISTERED', 'Register this CAT device first.');
-            return;
-          }
-
-          final pending = _pending[socket];
-          if (pending == null) {
-            _error(socket, 'HANDSHAKE_EXPIRED', 'Handshake expired.');
-            await socket.close(WebSocketStatus.policyViolation);
-            return;
-          }
-
-          if (DateTime.now().difference(pending.createdAt).inSeconds > 15) {
-            _error(socket, 'HANDSHAKE_EXPIRED', 'Handshake expired.');
-            await socket.close(WebSocketStatus.policyViolation);
-            return;
-          }
-
-          final catId = (message['catId'] as String?)?.trim();
-          final publicKeyText = (message['publicKey'] as String?)?.trim();
-          final signatureText = (message['signature'] as String?)?.trim();
-
-          if (catId == null ||
-              publicKeyText == null ||
-              signatureText == null ||
-              !RegExp(r'^CAT-\d{4}-\d{4}$').hasMatch(catId)) {
-            _error(socket, 'INVALID_REGISTER', 'Invalid registration payload.');
-            return;
-          }
-
-          final publicKeyBytes = _decode(publicKeyText);
-          final signatureBytes = _decode(signatureText);
-
-          if (publicKeyBytes.length != 32 || signatureBytes.length != 64) {
-            _error(socket, 'INVALID_KEY', 'Invalid Ed25519 key or signature length.');
-            return;
-          }
-
-          final expectedDigits = _catIdFromPublicKey(publicKeyBytes);
-          final expectedCatId = 'CAT-$expectedDigits';
-
-          if (catId != expectedCatId) {
-            _error(
-              socket,
-              'CAT_ID_BINDING_FAILED',
-              'CAT ID does not match the device public key.',
-            );
-            return;
-          }
-
-          final publicKey = SimplePublicKey(
-            publicKeyBytes,
-            type: KeyPairType.ed25519,
-          );
-
-          final signature = Signature(
-            signatureBytes,
-            publicKey: publicKey,
-          );
-
-          final signedText = '$catId|$publicKeyText|${pending.nonce}';
-
-          final verified = await _ed25519.verifyString(
-            signedText,
-            signature: signature,
-          );
-
-          if (!verified) {
-            _error(
-              socket,
-              'AUTH_FAILED',
-              'The device could not prove ownership of this CAT identity.',
-            );
-            await socket.close(WebSocketStatus.policyViolation);
-            return;
-          }
-
-          final old = _sessions[catId];
-          if (old != null && old.socket != socket) {
-            try {
-              await old.socket.close(WebSocketStatus.policyViolation);
-            } catch (_) {}
-          }
-
-          _sessions[catId] = CatSession(
-            catId: catId,
-            publicKey: publicKeyText,
-            socket: socket,
-          );
-          _pending.remove(socket);
-
-          _send(socket, {
-            'type': 'registered',
-            'catId': catId,
-            'online': true,
-          });
-
-          return;
-        }
-
-        switch (message['type']) {
-          case 'heartbeat':
-            session.lastSeen = DateTime.now();
-            _send(socket, {
-              'type': 'heartbeat_ack',
-            });
-            break;
-
-          case 'lookup':
-            final target = (message['catId'] as String?)?.trim();
-
-            if (target == null ||
-                !RegExp(r'^CAT-\d{4}-\d{4}$').hasMatch(target)) {
-              _error(socket, 'INVALID_CAT_ID', 'Invalid CAT ID.');
-              return;
-            }
-
-            final targetSession = _liveSession(target);
-
-            _send(socket, {
-              'type': 'lookup_result',
-              'catId': target,
-              'online': targetSession != null,
-            });
-            break;
-
-          case 'signal':
-            final target = (message['to'] as String?)?.trim();
-            final kind = (message['kind'] as String?)?.trim();
-            final data = message['data'];
-
-            if (target == null ||
-                kind == null ||
-                data == null ||
-                !RegExp(r'^CAT-\d{4}-\d{4}$').hasMatch(target)) {
-              _error(socket, 'INVALID_SIGNAL', 'Invalid signaling message.');
-              return;
-            }
-
-            final targetSession = _liveSession(target);
-
-            if (targetSession == null) {
-              _send(socket, {
-                'type': 'signal_result',
-                'to': target,
-                'delivered': false,
-                'reason': 'OFFLINE',
-              });
-              return;
-            }
-
-            _send(targetSession.socket, {
-              'type': 'signal',
-              'from': session.catId,
-              'kind': kind,
-              'data': data,
-            });
-
-            _send(socket, {
-              'type': 'signal_result',
-              'to': target,
-              'delivered': true,
-            });
-            break;
-
-          default:
-            _error(socket, 'UNKNOWN_TYPE', 'Unknown message type.');
-        }
-      } catch (error) {
-        _error(socket, 'SERVER_ERROR', 'The server could not process that message.');
-        stderr.writeln('Socket message error: $error');
-      }
-    },
-    onError: (_) async {
-      await _removeSocket(socket);
-    },
-    onDone: () async {
-      await _removeSocket(socket);
-      await subscription.cancel();
-    },
-    cancelOnError: false,
+  final server = await HttpServer.bind(
+    InternetAddress.anyIPv4,
+    port,
   );
-}
 
-CatSession? _sessionForSocket(WebSocket socket) {
-  for (final session in _sessions.values) {
-    if (session.socket == socket) {
-      return session;
-    }
+  stdout.writeln(
+    'CAT public server listening on http://0.0.0.0:$port',
+  );
+  stdout.writeln(
+    'Mode: ephemeral presence + signaling (no persistent CAT data)',
+  );
+
+  Timer.periodic(
+    const Duration(seconds: 30),
+    (_) => _expireChallenges(),
+  );
+
+  final shutdown =
+      Completer<void>();
+
+  if (Platform.isWindows ||
+      Platform.isLinux ||
+      Platform.isMacOS) {
+    ProcessSignal.sigint.watch().listen((_) {
+      if (!shutdown.isCompleted) {
+        shutdown.complete();
+      }
+    });
   }
-  return null;
-}
 
-CatSession? _liveSession(String catId) {
-  final session = _sessions[catId];
-  if (session == null) return null;
+  await Future.any([
+    _serve(server),
+    shutdown.future,
+  ]);
 
-  final age = DateTime.now().difference(session.lastSeen).inSeconds;
-  if (age > sessionTtlSeconds) {
-    _sessions.remove(catId);
+  await server.close(
+    force: true,
+  );
+
+  for (final peer
+      in _online.values.toList()) {
     try {
-      session.socket.close(WebSocketStatus.goingAway);
+      await peer.socket.close(
+        WebSocketStatus.goingAway,
+        'Server shutting down',
+      );
     } catch (_) {}
-    return null;
   }
 
-  return session;
+  _online.clear();
 }
 
-Future<void> _removeSocket(WebSocket socket) async {
-  _pending.remove(socket);
+Future<void> _serve(
+  HttpServer server,
+) async {
+  await for (final request
+      in server) {
+    try {
+      await _handle(request);
+    } catch (error) {
+      stderr.writeln(
+        'Request error: $error',
+      );
 
-  String? catIdToRemove;
-
-  for (final entry in _sessions.entries) {
-    if (entry.value.socket == socket) {
-      catIdToRemove = entry.key;
-      break;
-    }
-  }
-
-  if (catIdToRemove != null) {
-    final session = _sessions[catIdToRemove];
-    if (session?.socket == socket) {
-      _sessions.remove(catIdToRemove);
-    }
-  }
-}
-
-Future<void> _cleanupExpiredSessions() async {
-  final now = DateTime.now();
-
-  final expiredIds = <String>[];
-  for (final entry in _sessions.entries) {
-    if (now.difference(entry.value.lastSeen).inSeconds > sessionTtlSeconds) {
-      expiredIds.add(entry.key);
-    }
-  }
-
-  for (final catId in expiredIds) {
-    final session = _sessions.remove(catId);
-    if (session != null) {
       try {
-        await session.socket.close(WebSocketStatus.goingAway);
+        request.response
+          ..statusCode =
+              HttpStatus.internalServerError
+          ..headers.contentType =
+              ContentType.json
+          ..write(
+            jsonEncode({
+              'message':
+                  'Internal server error',
+            }),
+          );
+
+        await request.response
+            .close();
       } catch (_) {}
     }
   }
+}
 
-  final expiredPending = <WebSocket>[];
-  for (final entry in _pending.entries) {
-    if (now.difference(entry.value.createdAt).inSeconds > 15) {
-      expiredPending.add(entry.key);
-    }
+Future<void> _handle(
+  HttpRequest request,
+) async {
+  _commonHeaders(
+    request.response,
+  );
+
+  if (request.method == 'OPTIONS') {
+    request.response.statusCode =
+        HttpStatus.noContent;
+
+    await request.response
+        .close();
+
+    return;
   }
 
-  for (final socket in expiredPending) {
-    _pending.remove(socket);
+  final path =
+      request.uri.path;
+
+  // Health endpoint.
+  if (request.method == 'GET' &&
+      path == '/health') {
+    _respond(
+      request,
+      HttpStatus.ok,
+      {
+        'ok': true,
+        'service':
+            'cat-step3',
+        'mode':
+            'ephemeral-presence-and-signaling',
+      },
+    );
+
+    return;
+  }
+
+  // Issue a short-lived challenge.
+  if (request.method == 'POST' &&
+      path ==
+          '/v1/presence/challenge') {
+    final body =
+        await _readJson(request);
+
+    final catId =
+        body?['catId']
+                ?.toString()
+                .trim()
+                .toUpperCase() ??
+            '';
+
+    if (!_catIdPattern
+        .hasMatch(catId)) {
+      _respond(
+        request,
+        HttpStatus.badRequest,
+        {
+          'message':
+              'Invalid CAT ID format',
+        },
+      );
+
+      return;
+    }
+
+    final nonceBytes =
+        List<int>.generate(
+      32,
+      (_) => Random.secure()
+          .nextInt(256),
+    );
+
+    final nonce =
+        base64UrlEncode(
+      nonceBytes,
+    );
+
+    _pendingChallenges[catId] =
+        _Challenge(
+      nonce: nonce,
+      expiresAt:
+          DateTime.now()
+              .toUtc()
+              .add(
+                const Duration(
+                  minutes: 1,
+                ),
+              ),
+    );
+
+    _respond(
+      request,
+      HttpStatus.ok,
+      {
+        'nonce': nonce,
+      },
+    );
+
+    return;
+  }
+
+  // Look up an online CAT.
+  if (request.method == 'GET' &&
+      path == '/v1/presence') {
+    final catId =
+        request
+                .uri
+                .queryParameters['catId']
+                ?.trim()
+                .toUpperCase() ??
+            '';
+
+    if (!_catIdPattern
+        .hasMatch(catId)) {
+      _respond(
+        request,
+        HttpStatus.badRequest,
+        {
+          'message':
+              'Invalid CAT ID format',
+        },
+      );
+
+      return;
+    }
+
+    final peer =
+        _online[catId];
+
+    if (peer == null ||
+        peer.socket.readyState !=
+            WebSocket.open) {
+      _respond(
+        request,
+        HttpStatus.notFound,
+        {
+          'online': false,
+          'catId': catId,
+        },
+      );
+
+      return;
+    }
+
+    _respond(
+      request,
+      HttpStatus.ok,
+      {
+        'online': true,
+        'catId': peer.catId,
+        'signingPublicKey':
+            peer.signingPublicKey,
+        'exchangePublicKey':
+            peer.exchangePublicKey,
+        'publicFingerprint':
+            peer.publicFingerprint,
+      },
+    );
+
+    return;
+  }
+
+  if (request.method == 'GET' &&
+      path ==
+          '/v1/presence/count') {
+    _respond(
+      request,
+      HttpStatus.ok,
+      {
+        'online':
+            _online.length,
+      },
+    );
+
+    return;
+  }
+
+  // WebSocket used by CAT clients
+  // for presence + signaling.
+  if (request.method == 'GET' &&
+      path == '/v1/signal' &&
+      WebSocketTransformer
+          .isUpgradeRequest(
+        request,
+      )) {
     try {
-      await socket.close(WebSocketStatus.policyViolation);
-    } catch (_) {}
+      final socket =
+          await WebSocketTransformer
+              .upgrade(request);
+
+      await _handleSocket(
+        socket,
+      );
+    } catch (error) {
+      stderr.writeln(
+        'WebSocket upgrade error: $error',
+      );
+    }
+
+    return;
+  }
+
+  _respond(
+    request,
+    HttpStatus.notFound,
+    {
+      'message': 'Not found',
+    },
+  );
+}
+
+Future<void> _handleSocket(
+  WebSocket socket,
+) async {
+  _configureSocket(socket);
+
+  _PendingSocketRegistration?
+      registration;
+
+  try {
+    await for (final dynamic raw
+        in socket) {
+      if (raw is! String) {
+        continue;
+      }
+
+      final message =
+          _decodeObject(raw);
+
+      if (message == null) {
+        continue;
+      }
+
+      final type =
+          message['type']
+              ?.toString();
+
+      // Register CAT presence.
+      if (type ==
+          'presence.register') {
+        if (registration != null) {
+          _send(
+            socket,
+            {
+              'type':
+                  'presence',
+              'status':
+                  'rejected',
+              'message':
+                  'CAT presence already registered on this socket',
+            },
+          );
+
+          continue;
+        }
+
+        final result =
+            await _registerSocket(
+          socket,
+          message,
+        );
+
+        if (result != null) {
+          registration =
+              result;
+        }
+
+        continue;
+      }
+
+      // Nothing except registration
+      // is allowed before authentication.
+      if (registration == null) {
+        _send(
+          socket,
+          {
+            'type':
+                'presence',
+            'status':
+                'rejected',
+            'message':
+                'Register CAT presence before signaling',
+          },
+        );
+
+        continue;
+      }
+
+      // Route a transient signaling
+      // payload to another online CAT.
+      if (type ==
+          'signal.send') {
+        _routeSignal(
+          socket,
+          registration.catId,
+          message,
+        );
+
+        continue;
+      }
+    }
+  } catch (error) {
+    stderr.writeln(
+      'Socket error: $error',
+    );
+  } finally {
+    if (registration !=
+        null) {
+      final current =
+          _online[
+              registration.catId];
+
+      if (current != null &&
+          identical(
+            current.socket,
+            socket,
+          )) {
+        _online.remove(
+          registration.catId,
+        );
+      }
+    }
   }
 }
 
-Future<void> main() async {
-  final server = await HttpServer.bind(InternetAddress.anyIPv4, serverPort);
+Future<_PendingSocketRegistration?>
+    _registerSocket(
+  WebSocket socket,
+  Map<String, dynamic>
+      message,
+) async {
+  final catId =
+      message['catId']
+              ?.toString()
+              .trim()
+              .toUpperCase() ??
+          '';
 
-  print('CAT public server listening on http://0.0.0.0:$serverPort');
-  print('Mode: ephemeral presence + signaling (no persistent CAT data)');
+  final signingPublicKeyEncoded =
+      message['signingPublicKey']
+              ?.toString() ??
+          '';
 
-  Timer.periodic(
-    const Duration(seconds: 15),
-    (_) => _cleanupExpiredSessions(),
+  final exchangePublicKeyEncoded =
+      message['exchangePublicKey']
+              ?.toString() ??
+          '';
+
+  final fingerprint =
+      message['publicFingerprint']
+              ?.toString() ??
+          '';
+
+  final nonce =
+      message['nonce']
+              ?.toString() ??
+          '';
+
+  final signatureEncoded =
+      message['signature']
+              ?.toString() ??
+          '';
+
+  if (!_catIdPattern
+      .hasMatch(catId)) {
+    _reject(
+      socket,
+      'Invalid CAT ID format',
+    );
+
+    return null;
+  }
+
+  final challenge =
+      _pendingChallenges
+          .remove(catId);
+
+  if (challenge == null ||
+      DateTime.now()
+          .toUtc()
+          .isAfter(
+            challenge.expiresAt,
+          )) {
+    _reject(
+      socket,
+      'Presence challenge expired',
+    );
+
+    return null;
+  }
+
+  if (challenge.nonce != nonce) {
+    _reject(
+      socket,
+      'Invalid presence challenge',
+    );
+
+    return null;
+  }
+
+  late List<int>
+      signingPublicKeyBytes;
+
+  late List<int>
+      exchangePublicKeyBytes;
+
+  late List<int>
+      signatureBytes;
+
+  try {
+    signingPublicKeyBytes =
+        base64Url.decode(
+      signingPublicKeyEncoded,
+    );
+
+    exchangePublicKeyBytes =
+        base64Url.decode(
+      exchangePublicKeyEncoded,
+    );
+
+    signatureBytes =
+        base64Url.decode(
+      signatureEncoded,
+    );
+  } catch (_) {
+    _reject(
+      socket,
+      'Invalid key encoding',
+    );
+
+    return null;
+  }
+
+  if (signingPublicKeyBytes
+              .length !=
+          32 ||
+      exchangePublicKeyBytes
+              .length !=
+          32 ||
+      signatureBytes.length !=
+          64) {
+    _reject(
+      socket,
+      'Invalid CAT public key material',
+    );
+
+    return null;
+  }
+
+  final publicKey =
+      SimplePublicKey(
+    signingPublicKeyBytes,
+    type:
+        KeyPairType.ed25519,
   );
 
-  await for (final request in server) {
-    if (request.uri.path == '/health') {
-      request.response.headers.contentType = ContentType.json;
-      request.response.write(jsonEncode({
-        'ok': true,
-        'service': 'cat-step2',
-        'mode': 'ephemeral-presence-and-signaling',
-      }));
-      await request.response.close();
-      continue;
-    }
+  final signedMessage =
+      utf8.encode(
+    'CAT-PRESENCE\n$catId\n$nonce',
+  );
 
-    if (request.uri.path == '/ws' &&
-        WebSocketTransformer.isUpgradeRequest(request)) {
-      try {
-        final socket = await WebSocketTransformer.upgrade(request);
-        unawaited(_handleSocket(socket));
-      } catch (error) {
-        stderr.writeln('WebSocket upgrade failed: $error');
-        try {
-          await request.response.close();
-        } catch (_) {}
-      }
-      continue;
-    }
+  bool validProof =
+      false;
 
-    request.response.statusCode = HttpStatus.notFound;
-    await request.response.close();
+  try {
+    validProof =
+        await Ed25519().verify(
+      signedMessage,
+      signature:
+          Signature(
+        signatureBytes,
+        publicKey:
+            publicKey,
+      ),
+    );
+  } catch (_) {
+    validProof =
+        false;
   }
+
+  if (!validProof) {
+    _reject(
+      socket,
+      'Invalid CAT identity proof',
+    );
+
+    return null;
+  }
+
+  final previous =
+      _online[catId];
+
+  if (previous != null &&
+      !identical(
+        previous.socket,
+        socket,
+      )) {
+    try {
+      await previous.socket
+          .close(
+        WebSocketStatus
+            .policyViolation,
+        'CAT opened on another session',
+      );
+    } catch (_) {}
+  }
+
+  final peer =
+      _OnlineCat(
+    catId: catId,
+    signingPublicKey:
+        signingPublicKeyEncoded,
+    exchangePublicKey:
+        exchangePublicKeyEncoded,
+    publicFingerprint:
+        fingerprint,
+    socket: socket,
+  );
+
+  _online[catId] =
+      peer;
+
+  _send(
+    socket,
+    {
+      'type':
+          'presence',
+      'status':
+          'online',
+      'catId':
+          catId,
+    },
+  );
+
+  return _PendingSocketRegistration(
+    catId,
+  );
+}
+
+void _routeSignal(
+  WebSocket senderSocket,
+  String senderCatId,
+  Map<String, dynamic>
+      message,
+) {
+  final target =
+      message['to']
+              ?.toString()
+              .trim()
+              .toUpperCase() ??
+          '';
+
+  final rawPayload =
+      message['payload'];
+
+  if (!_catIdPattern
+          .hasMatch(target) ||
+      rawPayload is! Map) {
+    _send(
+      senderSocket,
+      {
+        'type':
+            'signal.error',
+        'message':
+            'Invalid signaling request',
+      },
+    );
+
+    return;
+  }
+
+  final recipient =
+      _online[target];
+
+  if (recipient == null ||
+      recipient.socket.readyState !=
+          WebSocket.open) {
+    _send(
+      senderSocket,
+      {
+        'type':
+            'signal.error',
+        'to':
+            target,
+        'message':
+            'TARGET CAT OFFLINE',
+      },
+    );
+
+    return;
+  }
+
+  final payload =
+      Map<String, dynamic>
+          .from(
+    rawPayload,
+  );
+
+  _send(
+    recipient.socket,
+    {
+      'type':
+          'signal',
+      'from':
+          senderCatId,
+      'payload':
+          payload,
+    },
+  );
+
+  _send(
+    senderSocket,
+    {
+      'type':
+          'signal.sent',
+      'to':
+          target,
+    },
+  );
+}
+
+void _reject(
+  WebSocket socket,
+  String message,
+) {
+  _send(
+    socket,
+    {
+      'type':
+          'presence',
+      'status':
+          'rejected',
+      'message':
+          message,
+    },
+  );
+
+  try {
+    socket.close(
+      WebSocketStatus
+          .policyViolation,
+      message,
+    );
+  } catch (_) {}
+}
+
+void _configureSocket(
+  WebSocket socket,
+) {
+  socket.pingInterval =
+      const Duration(
+    seconds: 20,
+  );
+}
+
+void _send(
+  WebSocket socket,
+  Map<String, dynamic>
+      message,
+) {
+  try {
+    if (socket.readyState ==
+        WebSocket.open) {
+      socket.add(
+        jsonEncode(message),
+      );
+    }
+  } catch (_) {}
+}
+
+void _expireChallenges() {
+  final now =
+      DateTime.now().toUtc();
+
+  _pendingChallenges.removeWhere(
+    (_, challenge) =>
+        now.isAfter(
+      challenge.expiresAt,
+    ),
+  );
+}
+
+Future<Map<String, dynamic>?>
+    _readJson(
+  HttpRequest request,
+) async {
+  final bytes =
+      <int>[];
+
+  await for (final chunk
+      in request) {
+    bytes.addAll(chunk);
+
+    if (bytes.length >
+        64 * 1024) {
+      return null;
+    }
+  }
+
+  if (bytes.isEmpty) {
+    return null;
+  }
+
+  try {
+    final decoded =
+        jsonDecode(
+      utf8.decode(bytes),
+    );
+
+    return decoded
+        is Map<String, dynamic>
+        ? decoded
+        : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+void _respond(
+  HttpRequest request,
+  int status,
+  Map<String, dynamic>
+      body,
+) {
+  request.response
+    ..statusCode = status
+    ..headers.contentType =
+        ContentType.json
+    ..write(
+      jsonEncode(body),
+    );
+
+  request.response
+      .close();
+}
+
+void _commonHeaders(
+  HttpResponse response,
+) {
+  response.headers
+    ..set(
+      'access-control-allow-origin',
+      '*',
+    )
+    ..set(
+      'access-control-allow-methods',
+      'GET,POST,OPTIONS',
+    )
+    ..set(
+      'access-control-allow-headers',
+      'content-type,accept',
+    );
+}
+
+String? _argValue(
+  List<String> args,
+  String name,
+) {
+  final index =
+      args.indexOf(name);
+
+  if (index == -1 ||
+      index + 1 >= args.length) {
+    return null;
+  }
+
+  return args[index + 1];
+}
+
+Map<String, dynamic>?
+    _decodeObject(
+  dynamic body,
+) {
+  if (body is! String ||
+      body.trim().isEmpty) {
+    return null;
+  }
+
+  try {
+    final decoded =
+        jsonDecode(body);
+
+    return decoded
+        is Map<String, dynamic>
+        ? decoded
+        : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+class _Challenge {
+  const _Challenge({
+    required this.nonce,
+    required this.expiresAt,
+  });
+
+  final String nonce;
+  final DateTime expiresAt;
+}
+
+class _OnlineCat {
+  const _OnlineCat({
+    required this.catId,
+    required this.signingPublicKey,
+    required this.exchangePublicKey,
+    required this.publicFingerprint,
+    required this.socket,
+  });
+
+  final String catId;
+  final String signingPublicKey;
+  final String exchangePublicKey;
+  final String publicFingerprint;
+  final WebSocket socket;
+}
+
+class _PendingSocketRegistration {
+  const _PendingSocketRegistration(
+    this.catId,
+  );
+
+  final String catId;
 }
