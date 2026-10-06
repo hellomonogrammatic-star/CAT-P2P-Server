@@ -1,8 +1,10 @@
-name: cat_server
-publish_to: none
+name: cat_p2p_server
+description: CAT ephemeral presence and WebSocket signaling server.
+publish_to: "none"
 
 environment:
-  sdk: '>=3.12.0 <4.0.0'
+  sdk: ">=3.3.0 <4.0.0"
 
 dependencies:
+  crypto: ^3.0.7
   cryptography: ^2.9.0
