@@ -2,13 +2,11 @@ FROM dart:stable
 
 WORKDIR /app
 
-COPY server/pubspec.yaml ./pubspec.yaml
+COPY server/pubspec.yaml server/pubspec.lock* ./
 RUN dart pub get
 
-COPY server/cat_directory_server.dart ./cat_directory_server.dart
+COPY server/ ./
 
-# Render sets PORT for public web services. The Dart server reads it at runtime.
-ENV PORT=10000
 EXPOSE 10000
 
-CMD ["dart", "run", "cat_directory_server.dart", "--host", "0.0.0.0"]
+CMD ["dart", "run", "cat_directory_server.dart"]
