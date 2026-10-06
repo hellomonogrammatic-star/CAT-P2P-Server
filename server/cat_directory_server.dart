@@ -8,16 +8,25 @@ import 'package:cryptography/cryptography.dart';
 final _catIdPattern =
     RegExp(r'^CAT-[A-Z0-9]{4}-[A-Z0-9]{4}$');
 
+const int _maxSocketFrameBytes =
+    512 * 1024;
+
+const int _maxSignalPayloadBytes =
+    256 * 1024;
+
 final _pendingChallenges =
     <String, _Challenge>{};
 
 final _online =
     <String, _OnlineCat>{};
 
-Future<void> main(List<String> args) async {
+Future<void> main(
+  List<String> args,
+) async {
   final port =
       int.tryParse(
-            Platform.environment['PORT'] ?? '',
+            Platform.environment['PORT'] ??
+                '',
           ) ??
           int.tryParse(
             _argValue(
@@ -39,11 +48,11 @@ Future<void> main(List<String> args) async {
   );
 
   stdout.writeln(
-    'Mode: ephemeral presence + signaling (no persistent CAT data)',
+    'Mode: concurrent ephemeral presence + WebSocket signaling',
   );
 
   stdout.writeln(
-    'Presence expires only when the WebSocket connection closes.',
+    'Presence exists while the authenticated WebSocket is alive.',
   );
 
   Timer.periodic(
@@ -88,34 +97,60 @@ Future<void> main(List<String> args) async {
   _online.clear();
 }
 
+/// IMPORTANT:
+/// Each incoming HTTP/WebSocket request is handled in its own
+/// asynchronous task.
+///
+/// We must NOT:
+///
+///   await _handle(request);
+///
+/// directly inside the HttpServer accept loop, because a WebSocket
+/// handler remains alive until that CAT disconnects. Awaiting it would
+/// prevent the server from processing other CATs.
+///
+/// This was the main bug causing one CAT to appear online while
+/// another CAT could not register.
 Future<void> _serve(
   HttpServer server,
 ) async {
   await for (final request
       in server) {
+    unawaited(
+      _handleSafely(request),
+    );
+  }
+}
+
+Future<void> _handleSafely(
+  HttpRequest request,
+) async {
+  try {
+    await _handle(request);
+  } catch (error, stack) {
+    stderr.writeln(
+      'Request error: $error',
+    );
+
+    stderr.writeln(
+      stack,
+    );
+
     try {
-      await _handle(request);
-    } catch (error) {
-      stderr.writeln(
-        'Request error: $error',
-      );
+      request.response
+        ..statusCode =
+            HttpStatus.internalServerError
+        ..headers.contentType =
+            ContentType.json
+        ..write(
+          jsonEncode({
+            'message':
+                'Internal server error',
+          }),
+        );
 
-      try {
-        request.response
-          ..statusCode =
-              HttpStatus.internalServerError
-          ..headers.contentType =
-              ContentType.json
-          ..write(
-            jsonEncode({
-              'message':
-                  'Internal server error',
-            }),
-          );
-
-        await request.response.close();
-      } catch (_) {}
-    }
+      await request.response.close();
+    } catch (_) {}
   }
 }
 
@@ -131,6 +166,7 @@ Future<void> _handle(
         HttpStatus.noContent;
 
     await request.response.close();
+
     return;
   }
 
@@ -149,9 +185,9 @@ Future<void> _handle(
       {
         'ok': true,
         'service':
-            'cat-step3',
+            'cat-step4',
         'mode':
-            'ephemeral-presence-and-signaling',
+            'concurrent-ephemeral-presence-and-signaling',
       },
     );
 
@@ -226,7 +262,7 @@ Future<void> _handle(
   }
 
   // ------------------------------------------------------------
-  // LOOKUP ONLINE CAT
+  // PRESENCE LOOKUP
   // ------------------------------------------------------------
 
   if (request.method == 'GET' &&
@@ -324,6 +360,9 @@ Future<void> _handle(
           await WebSocketTransformer
               .upgrade(request);
 
+      // This function may stay alive for the entire lifetime
+      // of this CAT. Because _serve() uses unawaited(), other
+      // CAT connections continue to work at the same time.
       await _handleSocket(
         socket,
       );
@@ -340,7 +379,8 @@ Future<void> _handle(
     request,
     HttpStatus.notFound,
     {
-      'message': 'Not found',
+      'message':
+          'Not found',
     },
   );
 }
@@ -348,10 +388,6 @@ Future<void> _handle(
 Future<void> _handleSocket(
   WebSocket socket,
 ) async {
-  // WebSocket-level liveness.
-  //
-  // This is NOT a 45-second CAT expiry.
-  // The server removes presence when the actual socket closes.
   socket.pingInterval =
       const Duration(
     seconds: 20,
@@ -367,6 +403,31 @@ Future<void> _handleSocket(
         continue;
       }
 
+      if (raw.length >
+          _maxSocketFrameBytes) {
+        _send(
+          socket,
+          {
+            'type':
+                'presence',
+            'status':
+                'rejected',
+            'message':
+                'Socket frame too large',
+          },
+        );
+
+        try {
+          await socket.close(
+            WebSocketStatus
+                .messageTooBig,
+            'Socket frame too large',
+          );
+        } catch (_) {}
+
+        return;
+      }
+
       final message =
           _decodeObject(raw);
 
@@ -379,7 +440,7 @@ Future<void> _handleSocket(
               ?.toString();
 
       // ----------------------------------------------------------
-      // REGISTRATION
+      // PRESENCE REGISTRATION
       // ----------------------------------------------------------
 
       if (type ==
@@ -415,7 +476,7 @@ Future<void> _handleSocket(
       }
 
       // ----------------------------------------------------------
-      // EVERYTHING ELSE REQUIRES REGISTRATION
+      // ALL OTHER COMMANDS REQUIRE AUTHENTICATED REGISTRATION
       // ----------------------------------------------------------
 
       if (registration == null) {
@@ -435,10 +496,7 @@ Future<void> _handleSocket(
       }
 
       // ----------------------------------------------------------
-      // OPTIONAL HEARTBEAT
-      //
-      // Presence does not depend on this anymore.
-      // It is accepted only as an explicit keepalive message.
+      // OPTIONAL APPLICATION KEEPALIVE
       // ----------------------------------------------------------
 
       if (type ==
@@ -455,7 +513,7 @@ Future<void> _handleSocket(
       }
 
       // ----------------------------------------------------------
-      // TRANSIENT SIGNAL
+      // TRANSIENT SIGNALING
       // ----------------------------------------------------------
 
       if (type ==
@@ -471,7 +529,7 @@ Future<void> _handleSocket(
     }
   } catch (error) {
     stderr.writeln(
-      'Socket error: $error',
+      'CAT socket error: $error',
     );
   } finally {
     if (registration !=
@@ -626,7 +684,9 @@ Future<_PendingSocketRegistration?>
 
   final signedMessage =
       utf8.encode(
-    'CAT-PRESENCE\n$catId\n$nonce',
+    'CAT-PRESENCE\n'
+    '$catId\n'
+    '$nonce',
   );
 
   bool validProof =
@@ -657,6 +717,25 @@ Future<_PendingSocketRegistration?>
     return null;
   }
 
+  // Verify the displayed fingerprint rather than trusting
+  // arbitrary client-supplied text.
+  final expectedFingerprint =
+      _fingerprint(
+    signingPublicKeyBytes,
+  );
+
+  if (fingerprint.isNotEmpty &&
+      fingerprint.toUpperCase() !=
+          expectedFingerprint) {
+    _reject(
+      socket,
+      'Invalid CAT fingerprint',
+    );
+
+    return null;
+  }
+
+  // Only one live session is permitted for the SAME CAT ID.
   final previous =
       _online[catId];
 
@@ -683,7 +762,7 @@ Future<_PendingSocketRegistration?>
     exchangePublicKey:
         exchangePublicKeyEncoded,
     publicFingerprint:
-        fingerprint,
+        expectedFingerprint,
     socket: socket,
   );
 
@@ -739,6 +818,47 @@ void _routeSignal(
     return;
   }
 
+  final payload =
+      Map<String, dynamic>
+          .from(
+    rawPayload,
+  );
+
+  // Keep signaling frames bounded.
+  try {
+    final payloadBytes =
+        utf8.encode(
+      jsonEncode(payload),
+    );
+
+    if (payloadBytes.length >
+        _maxSignalPayloadBytes) {
+      _send(
+        senderSocket,
+        {
+          'type':
+              'signal.error',
+          'message':
+              'Signaling payload too large',
+        },
+      );
+
+      return;
+    }
+  } catch (_) {
+    _send(
+      senderSocket,
+      {
+        'type':
+            'signal.error',
+        'message':
+            'Invalid signaling payload',
+      },
+    );
+
+    return;
+  }
+
   final recipient =
       _online[target];
 
@@ -759,12 +879,6 @@ void _routeSignal(
 
     return;
   }
-
-  final payload =
-      Map<String, dynamic>
-          .from(
-    rawPayload,
-  );
 
   _send(
     recipient.socket,
@@ -787,6 +901,24 @@ void _routeSignal(
           target,
     },
   );
+}
+
+String _fingerprint(
+  List<int> publicKeyBytes,
+) {
+  return publicKeyBytes
+      .take(12)
+      .map(
+        (value) =>
+            value
+                .toRadixString(16)
+                .padLeft(
+                  2,
+                  '0',
+                ),
+      )
+      .join(':')
+      .toUpperCase();
 }
 
 void _reject(
