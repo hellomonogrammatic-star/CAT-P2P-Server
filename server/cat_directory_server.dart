@@ -15,15 +15,21 @@ final _online =
     <String, _OnlineCat>{};
 
 Future<void> main(List<String> args) async {
-  final port = int.tryParse(
-        Platform.environment['PORT'] ?? '',
-      ) ??
+  final port =
       int.tryParse(
-        _argValue(args, '--port') ?? '',
-      ) ??
-      10000;
+            Platform.environment['PORT'] ?? '',
+          ) ??
+          int.tryParse(
+            _argValue(
+                  args,
+                  '--port',
+                ) ??
+                '',
+          ) ??
+          10000;
 
-  final server = await HttpServer.bind(
+  final server =
+      await HttpServer.bind(
     InternetAddress.anyIPv4,
     port,
   );
@@ -31,8 +37,13 @@ Future<void> main(List<String> args) async {
   stdout.writeln(
     'CAT public server listening on http://0.0.0.0:$port',
   );
+
   stdout.writeln(
     'Mode: ephemeral presence + signaling (no persistent CAT data)',
+  );
+
+  stdout.writeln(
+    'Presence expires only when the WebSocket connection closes.',
   );
 
   Timer.periodic(
@@ -46,7 +57,9 @@ Future<void> main(List<String> args) async {
   if (Platform.isWindows ||
       Platform.isLinux ||
       Platform.isMacOS) {
-    ProcessSignal.sigint.watch().listen((_) {
+    ProcessSignal.sigint
+        .watch()
+        .listen((_) {
       if (!shutdown.isCompleted) {
         shutdown.complete();
       }
@@ -100,8 +113,7 @@ Future<void> _serve(
             }),
           );
 
-        await request.response
-            .close();
+        await request.response.close();
       } catch (_) {}
     }
   }
@@ -118,16 +130,17 @@ Future<void> _handle(
     request.response.statusCode =
         HttpStatus.noContent;
 
-    await request.response
-        .close();
-
+    await request.response.close();
     return;
   }
 
   final path =
       request.uri.path;
 
-  // Health endpoint.
+  // ------------------------------------------------------------
+  // HEALTH
+  // ------------------------------------------------------------
+
   if (request.method == 'GET' &&
       path == '/health') {
     _respond(
@@ -145,7 +158,10 @@ Future<void> _handle(
     return;
   }
 
-  // Issue a short-lived challenge.
+  // ------------------------------------------------------------
+  // PRESENCE CHALLENGE
+  // ------------------------------------------------------------
+
   if (request.method == 'POST' &&
       path ==
           '/v1/presence/challenge') {
@@ -209,7 +225,10 @@ Future<void> _handle(
     return;
   }
 
-  // Look up an online CAT.
+  // ------------------------------------------------------------
+  // LOOKUP ONLINE CAT
+  // ------------------------------------------------------------
+
   if (request.method == 'GET' &&
       path == '/v1/presence') {
     final catId =
@@ -257,7 +276,8 @@ Future<void> _handle(
       HttpStatus.ok,
       {
         'online': true,
-        'catId': peer.catId,
+        'catId':
+            peer.catId,
         'signingPublicKey':
             peer.signingPublicKey,
         'exchangePublicKey':
@@ -269,6 +289,10 @@ Future<void> _handle(
 
     return;
   }
+
+  // ------------------------------------------------------------
+  // ONLINE COUNT
+  // ------------------------------------------------------------
 
   if (request.method == 'GET' &&
       path ==
@@ -285,8 +309,10 @@ Future<void> _handle(
     return;
   }
 
-  // WebSocket used by CAT clients
-  // for presence + signaling.
+  // ------------------------------------------------------------
+  // WEB SOCKET
+  // ------------------------------------------------------------
+
   if (request.method == 'GET' &&
       path == '/v1/signal' &&
       WebSocketTransformer
@@ -322,7 +348,14 @@ Future<void> _handle(
 Future<void> _handleSocket(
   WebSocket socket,
 ) async {
-  _configureSocket(socket);
+  // WebSocket-level liveness.
+  //
+  // This is NOT a 45-second CAT expiry.
+  // The server removes presence when the actual socket closes.
+  socket.pingInterval =
+      const Duration(
+    seconds: 20,
+  );
 
   _PendingSocketRegistration?
       registration;
@@ -345,7 +378,10 @@ Future<void> _handleSocket(
           message['type']
               ?.toString();
 
-      // Register CAT presence.
+      // ----------------------------------------------------------
+      // REGISTRATION
+      // ----------------------------------------------------------
+
       if (type ==
           'presence.register') {
         if (registration != null) {
@@ -378,8 +414,10 @@ Future<void> _handleSocket(
         continue;
       }
 
-      // Nothing except registration
-      // is allowed before authentication.
+      // ----------------------------------------------------------
+      // EVERYTHING ELSE REQUIRES REGISTRATION
+      // ----------------------------------------------------------
+
       if (registration == null) {
         _send(
           socket,
@@ -396,8 +434,30 @@ Future<void> _handleSocket(
         continue;
       }
 
-      // Route a transient signaling
-      // payload to another online CAT.
+      // ----------------------------------------------------------
+      // OPTIONAL HEARTBEAT
+      //
+      // Presence does not depend on this anymore.
+      // It is accepted only as an explicit keepalive message.
+      // ----------------------------------------------------------
+
+      if (type ==
+          'presence.heartbeat') {
+        _send(
+          socket,
+          {
+            'type':
+                'presence.heartbeat_ack',
+          },
+        );
+
+        continue;
+      }
+
+      // ----------------------------------------------------------
+      // TRANSIENT SIGNAL
+      // ----------------------------------------------------------
+
       if (type ==
           'signal.send') {
         _routeSignal(
@@ -752,15 +812,6 @@ void _reject(
       message,
     );
   } catch (_) {}
-}
-
-void _configureSocket(
-  WebSocket socket,
-) {
-  socket.pingInterval =
-      const Duration(
-    seconds: 20,
-  );
 }
 
 void _send(
