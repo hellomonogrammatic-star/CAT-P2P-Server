@@ -14,6 +14,9 @@ const int _maxSocketFrameBytes =
 const int _maxSignalPayloadBytes =
     256 * 1024;
 
+const int _turnCredentialTtlSeconds =
+    86400;
+
 final _pendingChallenges =
     <String, _Challenge>{};
 
@@ -496,6 +499,48 @@ Future<void> _handleSocket(
       }
 
       // ----------------------------------------------------------
+      // AUTHENTICATED TURN CREDENTIALS
+      // ----------------------------------------------------------
+      //
+      // TURN is only requested by a CAT that already completed
+      // the authenticated presence registration above. The
+      // long-lived Cloudflare TURN key never leaves this server.
+      // The app receives short-lived ICE server credentials only.
+      if (type ==
+          'turn.credentials.request') {
+        try {
+          final credentials =
+              await _generateTurnCredentials();
+
+          _send(
+            socket,
+            {
+              'type':
+                  'turn.credentials',
+              'iceServers':
+                  credentials,
+            },
+          );
+        } catch (error) {
+          stderr.writeln(
+            'TURN credential generation failed for ${registration.catId}: $error',
+          );
+
+          _send(
+            socket,
+            {
+              'type':
+                  'turn.credentials.error',
+              'message':
+                  'TURN credentials unavailable',
+            },
+          );
+        }
+
+        continue;
+      }
+
+      // ----------------------------------------------------------
       // OPTIONAL APPLICATION KEEPALIVE
       // ----------------------------------------------------------
 
@@ -784,6 +829,108 @@ Future<_PendingSocketRegistration?>
   return _PendingSocketRegistration(
     catId,
   );
+}
+
+Future<List<Map<String, dynamic>>> _generateTurnCredentials() async {
+  final keyId =
+      Platform.environment['CLOUDFLARE_TURN_KEY_ID']
+              ?.trim() ??
+          '';
+
+  final apiToken =
+      Platform.environment['CLOUDFLARE_TURN_API_TOKEN']
+              ?.trim() ??
+          '';
+
+  if (keyId.isEmpty || apiToken.isEmpty) {
+    throw StateError(
+      'Cloudflare TURN server credentials are not configured',
+    );
+  }
+
+  final endpoint = Uri.parse(
+    'https://rtc.live.cloudflare.com/v1/turn/keys/'
+    '$keyId/credentials/generate-ice-servers',
+  );
+
+  final client = HttpClient();
+  client.connectionTimeout =
+      const Duration(seconds: 10);
+
+  try {
+    final request =
+        await client.postUrl(endpoint);
+
+    request.headers
+      ..contentType = ContentType.json
+      ..set(
+        HttpHeaders.authorizationHeader,
+        'Bearer $apiToken',
+      )
+      ..set(
+        HttpHeaders.acceptHeader,
+        'application/json',
+      );
+
+    request.write(
+      jsonEncode({
+        'ttl':
+            _turnCredentialTtlSeconds,
+      }),
+    );
+
+    final response =
+        await request.close().timeout(
+      const Duration(seconds: 10),
+    );
+
+    final body =
+        await response
+            .transform(utf8.decoder)
+            .join()
+            .timeout(
+          const Duration(seconds: 10),
+        );
+
+    final decoded =
+        _decodeObject(body);
+
+    if (response.statusCode !=
+            HttpStatus.created ||
+        decoded == null ||
+        decoded['iceServers'] is! List) {
+      throw StateError(
+        'Cloudflare TURN API returned HTTP ${response.statusCode}',
+      );
+    }
+
+    final rawServers =
+        decoded['iceServers'] as List;
+
+    final servers =
+        rawServers
+            .whereType<Map>()
+            .map(
+              (item) =>
+                  Map<String, dynamic>.from(item),
+            )
+            .where(
+              (item) => item['urls'] != null,
+            )
+            .toList();
+
+    if (servers.isEmpty) {
+      throw StateError(
+        'Cloudflare TURN API returned no ICE servers',
+      );
+    }
+
+    return servers;
+  } finally {
+    client.close(
+      force: true,
+    );
+  }
 }
 
 void _routeSignal(
