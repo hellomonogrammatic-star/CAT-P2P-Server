@@ -6,16 +6,13 @@ import 'dart:math';
 import 'package:cryptography/cryptography.dart';
 
 const String _serverVersion =
-    'cat-step4-cat-id-fix-v3';
+    'cat-step4-final';
 
 const int _maxSocketFrameBytes =
     512 * 1024;
 
 const int _maxSignalPayloadBytes =
     256 * 1024;
-
-const int _maxRequestBodyBytes =
-    64 * 1024;
 
 const int _turnCredentialTtlSeconds =
     86400;
@@ -31,16 +28,17 @@ Future<void> main(
 ) async {
   final port =
       int.tryParse(
-            Platform.environment['PORT'] ?? '',
-          ) ??
-          int.tryParse(
-            _argValue(
-                  args,
-                  '--port',
-                ) ??
+            Platform.environment['PORT'] ??
                 '',
           ) ??
-          10000;
+          int.tryParse(
+                _argValue(
+                      args,
+                      '--port',
+                    ) ??
+                    '',
+              ) ??
+              10000;
 
   final server =
       await HttpServer.bind(
@@ -106,10 +104,9 @@ Future<void> main(
   _online.clear();
 }
 
-/// Each HTTP/WebSocket request is handled independently.
-///
-/// A WebSocket connection can remain alive for the entire lifetime
-/// of a CAT, so it must never block the main HTTP accept loop.
+/// Each incoming request is processed independently.
+/// Long-lived WebSocket connections therefore do not block
+/// other CAT clients from connecting.
 Future<void> _serve(
   HttpServer server,
 ) async {
@@ -206,47 +203,8 @@ Future<void> _handle(
   if (request.method == 'POST' &&
       path ==
           '/v1/presence/challenge') {
-    final rawBody =
-        await _readRequestBody(
-      request,
-    );
-
-    // Diagnostic server-side logging.
-    //
-    // This is only the presence challenge request body and therefore
-    // contains the CAT ID sent by the app.
-    stderr.writeln(
-      'Presence challenge body length: ${rawBody.length}',
-    );
-
-    stderr.writeln(
-      'Presence challenge content-type: '
-      '${request.headers.contentType}',
-    );
-
-    stderr.writeln(
-      'Presence challenge body: ${jsonEncode(rawBody)}',
-    );
-
-    if (rawBody.isEmpty) {
-      await _respond(
-        request,
-        HttpStatus.badRequest,
-        {
-          'message':
-              'Empty JSON body',
-          'version':
-              _serverVersion,
-        },
-      );
-
-      return;
-    }
-
     final body =
-        _decodeJsonObject(
-      rawBody,
-    );
+        await _readJson(request);
 
     if (body == null) {
       await _respond(
@@ -263,19 +221,12 @@ Future<void> _handle(
       return;
     }
 
-    final rawCatId =
-        body['catId'];
-
     final catId =
-        rawCatId
+        body['catId']
                 ?.toString()
                 .trim()
                 .toUpperCase() ??
             '';
-
-    stderr.writeln(
-      'Presence challenge parsed CAT ID: $catId',
-    );
 
     if (!_isValidCatId(catId)) {
       await _respond(
@@ -286,10 +237,6 @@ Future<void> _handle(
               'Invalid CAT ID format',
           'version':
               _serverVersion,
-          'expectedFormat':
-              'CAT-XXXX-XXXX',
-          'received':
-              catId,
         },
       );
 
@@ -500,9 +447,7 @@ Future<void> _handleSocket(
       }
 
       final message =
-          _decodeObject(
-        raw,
-      );
+          _decodeObject(raw);
 
       if (message == null) {
         continue;
@@ -549,7 +494,7 @@ Future<void> _handleSocket(
       }
 
       // ----------------------------------------------------------
-      // AUTHENTICATED COMMANDS ONLY
+      // AUTHENTICATED COMMANDS
       // ----------------------------------------------------------
 
       if (registration == null) {
@@ -852,8 +797,7 @@ Future<_PendingSocketRegistration?>
         socket,
       )) {
     try {
-      await previous.socket
-          .close(
+      await previous.socket.close(
         WebSocketStatus
             .policyViolation,
         'CAT opened on another session',
@@ -1133,13 +1077,13 @@ void _routeSignal(
   );
 }
 
-/// Valid CAT ID format:
+/// Accepted format:
 ///
 /// CAT-XXXX-XXXX
 ///
 /// Each X is A-Z or 0-9.
 ///
-/// The ID is uppercased before this function is called.
+/// CAT IDs are uppercased before validation.
 bool _isValidCatId(
   String catId,
 ) {
@@ -1264,97 +1208,40 @@ void _expireChallenges() {
   );
 }
 
-/// Reads the complete HTTP request body as UTF-8.
-///
-/// This intentionally uses utf8.decoder.bind(request).join()
-/// rather than relying on the JSON decoder to operate directly
-/// on request chunks.
-Future<String> _readRequestBody(
+Future<Map<String, dynamic>?>
+    _readJson(
   HttpRequest request,
 ) async {
-  try {
-    final contentLength =
-        request.contentLength;
+  final bytes =
+      <int>[];
 
-    if (contentLength > _maxRequestBodyBytes) {
-      return '';
+  await for (final chunk
+      in request) {
+    bytes.addAll(chunk);
+
+    if (bytes.length >
+        64 * 1024) {
+      return null;
     }
-
-    var body =
-        await utf8
-            .decoder
-            .bind(request)
-            .join();
-
-    if (body.length >
-        _maxRequestBodyBytes) {
-      return '';
-    }
-
-    // Remove UTF-8 BOM if a client happens to include one.
-    if (body.isNotEmpty &&
-        body.codeUnitAt(0) ==
-            0xFEFF) {
-      body =
-          body.substring(1);
-    }
-
-    return body.trim();
-  } catch (error, stack) {
-    stderr.writeln(
-      'Request body read error: $error',
-    );
-
-    stderr.writeln(
-      stack,
-    );
-
-    return '';
   }
-}
 
-Map<String, dynamic>?
-    _decodeJsonObject(
-  String body,
-) {
-  if (body.trim().isEmpty) {
+  if (bytes.isEmpty) {
     return null;
   }
 
   try {
     final decoded =
         jsonDecode(
-      body,
+      utf8.decode(bytes),
     );
 
-    if (decoded is Map) {
-      return Map<String, dynamic>.from(
-        decoded,
-      );
-    }
-
-    return null;
-  } catch (error) {
-    stderr.writeln(
-      'JSON decode error: $error',
-    );
-
+    return decoded
+        is Map<String, dynamic>
+        ? decoded
+        : null;
+  } catch (_) {
     return null;
   }
-}
-
-Map<String, dynamic>?
-    _decodeObject(
-  dynamic body,
-) {
-  if (body is! String ||
-      body.trim().isEmpty) {
-    return null;
-  }
-
-  return _decodeJsonObject(
-    body,
-  );
 }
 
 Future<void> _respond(
@@ -1379,9 +1266,7 @@ Future<void> _respond(
     );
 
     try {
-      await request.response.close(
-        force: true,
-      );
+      await request.response.close();
     } catch (_) {}
   }
 }
@@ -1417,6 +1302,28 @@ String? _argValue(
   }
 
   return args[index + 1];
+}
+
+Map<String, dynamic>?
+    _decodeObject(
+  dynamic body,
+) {
+  if (body is! String ||
+      body.trim().isEmpty) {
+    return null;
+  }
+
+  try {
+    final decoded =
+        jsonDecode(body);
+
+    return decoded
+        is Map<String, dynamic>
+        ? decoded
+        : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 class _Challenge {
