@@ -6,13 +6,16 @@ import 'dart:math';
 import 'package:cryptography/cryptography.dart';
 
 const String _serverVersion =
-    'cat-step4-cat-id-fix-v2';
+    'cat-step4-cat-id-fix-v3';
 
 const int _maxSocketFrameBytes =
     512 * 1024;
 
 const int _maxSignalPayloadBytes =
     256 * 1024;
+
+const int _maxRequestBodyBytes =
+    64 * 1024;
 
 const int _turnCredentialTtlSeconds =
     86400;
@@ -103,6 +106,10 @@ Future<void> main(
   _online.clear();
 }
 
+/// Each HTTP/WebSocket request is handled independently.
+///
+/// A WebSocket connection can remain alive for the entire lifetime
+/// of a CAT, so it must never block the main HTTP accept loop.
 Future<void> _serve(
   HttpServer server,
 ) async {
@@ -138,6 +145,8 @@ Future<void> _handleSafely(
           jsonEncode({
             'message':
                 'Internal server error',
+            'version':
+                _serverVersion,
           }),
         );
 
@@ -171,7 +180,7 @@ Future<void> _handle(
 
   if (request.method == 'GET' &&
       path == '/health') {
-    _respond(
+    await _respond(
       request,
       HttpStatus.ok,
       {
@@ -197,11 +206,50 @@ Future<void> _handle(
   if (request.method == 'POST' &&
       path ==
           '/v1/presence/challenge') {
+    final rawBody =
+        await _readRequestBody(
+      request,
+    );
+
+    // Diagnostic server-side logging.
+    //
+    // This is only the presence challenge request body and therefore
+    // contains the CAT ID sent by the app.
+    stderr.writeln(
+      'Presence challenge body length: ${rawBody.length}',
+    );
+
+    stderr.writeln(
+      'Presence challenge content-type: '
+      '${request.headers.contentType}',
+    );
+
+    stderr.writeln(
+      'Presence challenge body: ${jsonEncode(rawBody)}',
+    );
+
+    if (rawBody.isEmpty) {
+      await _respond(
+        request,
+        HttpStatus.badRequest,
+        {
+          'message':
+              'Empty JSON body',
+          'version':
+              _serverVersion,
+        },
+      );
+
+      return;
+    }
+
     final body =
-        await _readJson(request);
+        _decodeJsonObject(
+      rawBody,
+    );
 
     if (body == null) {
-      _respond(
+      await _respond(
         request,
         HttpStatus.badRequest,
         {
@@ -215,15 +263,22 @@ Future<void> _handle(
       return;
     }
 
+    final rawCatId =
+        body['catId'];
+
     final catId =
-        body['catId']
+        rawCatId
                 ?.toString()
                 .trim()
                 .toUpperCase() ??
             '';
 
+    stderr.writeln(
+      'Presence challenge parsed CAT ID: $catId',
+    );
+
     if (!_isValidCatId(catId)) {
-      _respond(
+      await _respond(
         request,
         HttpStatus.badRequest,
         {
@@ -231,6 +286,10 @@ Future<void> _handle(
               'Invalid CAT ID format',
           'version':
               _serverVersion,
+          'expectedFormat':
+              'CAT-XXXX-XXXX',
+          'received':
+              catId,
         },
       );
 
@@ -262,7 +321,7 @@ Future<void> _handle(
               ),
     );
 
-    _respond(
+    await _respond(
       request,
       HttpStatus.ok,
       {
@@ -288,7 +347,7 @@ Future<void> _handle(
             '';
 
     if (!_isValidCatId(catId)) {
-      _respond(
+      await _respond(
         request,
         HttpStatus.badRequest,
         {
@@ -308,7 +367,7 @@ Future<void> _handle(
     if (peer == null ||
         peer.socket.readyState !=
             WebSocket.open) {
-      _respond(
+      await _respond(
         request,
         HttpStatus.notFound,
         {
@@ -320,7 +379,7 @@ Future<void> _handle(
       return;
     }
 
-    _respond(
+    await _respond(
       request,
       HttpStatus.ok,
       {
@@ -346,7 +405,7 @@ Future<void> _handle(
   if (request.method == 'GET' &&
       path ==
           '/v1/presence/count') {
-    _respond(
+    await _respond(
       request,
       HttpStatus.ok,
       {
@@ -359,7 +418,7 @@ Future<void> _handle(
   }
 
   // ------------------------------------------------------------
-  // WEB SOCKET
+  // WEB SOCKET SIGNALING
   // ------------------------------------------------------------
 
   if (request.method == 'GET' &&
@@ -385,12 +444,14 @@ Future<void> _handle(
     return;
   }
 
-  _respond(
+  await _respond(
     request,
     HttpStatus.notFound,
     {
       'message':
           'Not found',
+      'version':
+          _serverVersion,
     },
   );
 }
@@ -439,7 +500,9 @@ Future<void> _handleSocket(
       }
 
       final message =
-          _decodeObject(raw);
+          _decodeObject(
+        raw,
+      );
 
       if (message == null) {
         continue;
@@ -448,6 +511,10 @@ Future<void> _handleSocket(
       final type =
           message['type']
               ?.toString();
+
+      // ----------------------------------------------------------
+      // PRESENCE REGISTRATION
+      // ----------------------------------------------------------
 
       if (type ==
           'presence.register') {
@@ -481,6 +548,10 @@ Future<void> _handleSocket(
         continue;
       }
 
+      // ----------------------------------------------------------
+      // AUTHENTICATED COMMANDS ONLY
+      // ----------------------------------------------------------
+
       if (registration == null) {
         _send(
           socket,
@@ -496,6 +567,10 @@ Future<void> _handleSocket(
 
         continue;
       }
+
+      // ----------------------------------------------------------
+      // TURN CREDENTIALS
+      // ----------------------------------------------------------
 
       if (type ==
           'turn.credentials.request') {
@@ -514,7 +589,8 @@ Future<void> _handleSocket(
           );
         } catch (error) {
           stderr.writeln(
-            'TURN credential generation failed for ${registration.catId}: $error',
+            'TURN credential generation failed for '
+            '${registration.catId}: $error',
           );
 
           _send(
@@ -531,6 +607,10 @@ Future<void> _handleSocket(
         continue;
       }
 
+      // ----------------------------------------------------------
+      // APPLICATION KEEPALIVE
+      // ----------------------------------------------------------
+
       if (type ==
           'presence.heartbeat') {
         _send(
@@ -543,6 +623,10 @@ Future<void> _handleSocket(
 
         continue;
       }
+
+      // ----------------------------------------------------------
+      // TRANSIENT SIGNALING
+      // ----------------------------------------------------------
 
       if (type ==
           'signal.send') {
@@ -758,6 +842,7 @@ Future<_PendingSocketRegistration?>
     return null;
   }
 
+  // Only one live session is permitted for the same CAT ID.
   final previous =
       _online[catId];
 
@@ -888,14 +973,17 @@ Future<List<Map<String, dynamic>>>
         );
 
     final decoded =
-        _decodeObject(body);
+        _decodeObject(
+      body,
+    );
 
     if (response.statusCode !=
             HttpStatus.created ||
         decoded == null ||
         decoded['iceServers'] is! List) {
       throw StateError(
-        'Cloudflare TURN API returned HTTP ${response.statusCode}',
+        'Cloudflare TURN API returned HTTP '
+        '${response.statusCode}',
       );
     }
 
@@ -1045,11 +1133,13 @@ void _routeSignal(
   );
 }
 
-/// Validates exactly:
+/// Valid CAT ID format:
 ///
 /// CAT-XXXX-XXXX
 ///
-/// Each X must be A-Z or 0-9 after uppercasing.
+/// Each X is A-Z or 0-9.
+///
+/// The ID is uppercased before this function is called.
 bool _isValidCatId(
   String catId,
 ) {
@@ -1057,8 +1147,7 @@ bool _isValidCatId(
     return false;
   }
 
-  if (catId.substring(0, 4) !=
-      'CAT-') {
+  if (!catId.startsWith('CAT-')) {
     return false;
   }
 
@@ -1093,15 +1182,16 @@ bool _isValidCatId(
 bool _isAlphaNumeric(
   int codeUnit,
 ) {
-  final upper =
+  final isUppercaseLetter =
       codeUnit >= 65 &&
       codeUnit <= 90;
 
-  final digit =
+  final isDigit =
       codeUnit >= 48 &&
       codeUnit <= 57;
 
-  return upper || digit;
+  return isUppercaseLetter ||
+      isDigit;
 }
 
 String _fingerprint(
@@ -1174,31 +1264,67 @@ void _expireChallenges() {
   );
 }
 
-Future<Map<String, dynamic>?>
-    _readJson(
+/// Reads the complete HTTP request body as UTF-8.
+///
+/// This intentionally uses utf8.decoder.bind(request).join()
+/// rather than relying on the JSON decoder to operate directly
+/// on request chunks.
+Future<String> _readRequestBody(
   HttpRequest request,
 ) async {
-  final bytes =
-      <int>[];
+  try {
+    final contentLength =
+        request.contentLength;
 
-  await for (final chunk
-      in request) {
-    bytes.addAll(chunk);
-
-    if (bytes.length >
-        64 * 1024) {
-      return null;
+    if (contentLength > _maxRequestBodyBytes) {
+      return '';
     }
-  }
 
-  if (bytes.isEmpty) {
+    var body =
+        await utf8
+            .decoder
+            .bind(request)
+            .join();
+
+    if (body.length >
+        _maxRequestBodyBytes) {
+      return '';
+    }
+
+    // Remove UTF-8 BOM if a client happens to include one.
+    if (body.isNotEmpty &&
+        body.codeUnitAt(0) ==
+            0xFEFF) {
+      body =
+          body.substring(1);
+    }
+
+    return body.trim();
+  } catch (error, stack) {
+    stderr.writeln(
+      'Request body read error: $error',
+    );
+
+    stderr.writeln(
+      stack,
+    );
+
+    return '';
+  }
+}
+
+Map<String, dynamic>?
+    _decodeJsonObject(
+  String body,
+) {
+  if (body.trim().isEmpty) {
     return null;
   }
 
   try {
     final decoded =
         jsonDecode(
-      utf8.decode(bytes),
+      body,
     );
 
     if (decoded is Map) {
@@ -1208,28 +1334,56 @@ Future<Map<String, dynamic>?>
     }
 
     return null;
-  } catch (_) {
+  } catch (error) {
+    stderr.writeln(
+      'JSON decode error: $error',
+    );
+
     return null;
   }
 }
 
-void _respond(
+Map<String, dynamic>?
+    _decodeObject(
+  dynamic body,
+) {
+  if (body is! String ||
+      body.trim().isEmpty) {
+    return null;
+  }
+
+  return _decodeJsonObject(
+    body,
+  );
+}
+
+Future<void> _respond(
   HttpRequest request,
   int status,
   Map<String, dynamic>
       body,
-) {
-  request.response
-    ..statusCode = status
-    ..headers.contentType =
-        ContentType.json
-    ..write(
-      jsonEncode(body),
+) async {
+  try {
+    request.response
+      ..statusCode = status
+      ..headers.contentType =
+          ContentType.json
+      ..write(
+        jsonEncode(body),
+      );
+
+    await request.response.close();
+  } catch (error) {
+    stderr.writeln(
+      'Response error: $error',
     );
 
-  unawaited(
-    request.response.close(),
-  );
+    try {
+      await request.response.close(
+        force: true,
+      );
+    } catch (_) {}
+  }
 }
 
 void _commonHeaders(
@@ -1263,31 +1417,6 @@ String? _argValue(
   }
 
   return args[index + 1];
-}
-
-Map<String, dynamic>?
-    _decodeObject(
-  dynamic body,
-) {
-  if (body is! String ||
-      body.trim().isEmpty) {
-    return null;
-  }
-
-  try {
-    final decoded =
-        jsonDecode(body);
-
-    if (decoded is Map) {
-      return Map<String, dynamic>.from(
-        decoded,
-      );
-    }
-
-    return null;
-  } catch (_) {
-    return null;
-  }
 }
 
 class _Challenge {
