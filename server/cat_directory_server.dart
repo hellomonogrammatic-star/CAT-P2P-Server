@@ -5,8 +5,8 @@ import 'dart:math';
 
 import 'package:cryptography/cryptography.dart';
 
-final _catIdPattern =
-    RegExp(r'^CAT-[A-Z0-9]{4}-[A-Z0-9]{4}$');
+const String _serverVersion =
+    'cat-step4-cat-id-fix-v2';
 
 const int _maxSocketFrameBytes =
     512 * 1024;
@@ -47,6 +47,10 @@ Future<void> main(
 
   stdout.writeln(
     'CAT public server listening on http://0.0.0.0:$port',
+  );
+
+  stdout.writeln(
+    'Server version: $_serverVersion',
   );
 
   stdout.writeln(
@@ -99,16 +103,11 @@ Future<void> main(
   _online.clear();
 }
 
-/// IMPORTANT:
-/// Every incoming HTTP/WebSocket request is handled independently.
-///
-/// We must NOT await a long-lived WebSocket handler directly inside
-/// the HTTP accept loop. Otherwise one connected CAT can prevent
-/// other CATs from registering.
 Future<void> _serve(
   HttpServer server,
 ) async {
-  await for (final request in server) {
+  await for (final request
+      in server) {
     unawaited(
       _handleSafely(request),
     );
@@ -179,6 +178,10 @@ Future<void> _handle(
         'ok': true,
         'service':
             'cat-step4',
+        'version':
+            _serverVersion,
+        'catIdFormat':
+            'CAT-XXXX-XXXX',
         'mode':
             'concurrent-ephemeral-presence-and-signaling',
       },
@@ -197,21 +200,37 @@ Future<void> _handle(
     final body =
         await _readJson(request);
 
+    if (body == null) {
+      _respond(
+        request,
+        HttpStatus.badRequest,
+        {
+          'message':
+              'Invalid JSON body',
+          'version':
+              _serverVersion,
+        },
+      );
+
+      return;
+    }
+
     final catId =
-        body?['catId']
+        body['catId']
                 ?.toString()
                 .trim()
                 .toUpperCase() ??
             '';
 
-    if (!_catIdPattern
-        .hasMatch(catId)) {
+    if (!_isValidCatId(catId)) {
       _respond(
         request,
         HttpStatus.badRequest,
         {
           'message':
               'Invalid CAT ID format',
+          'version':
+              _serverVersion,
         },
       );
 
@@ -268,14 +287,15 @@ Future<void> _handle(
                 .toUpperCase() ??
             '';
 
-    if (!_catIdPattern
-        .hasMatch(catId)) {
+    if (!_isValidCatId(catId)) {
       _respond(
         request,
         HttpStatus.badRequest,
         {
           'message':
               'Invalid CAT ID format',
+          'version':
+              _serverVersion,
         },
       );
 
@@ -339,7 +359,7 @@ Future<void> _handle(
   }
 
   // ------------------------------------------------------------
-  // WEB SOCKET SIGNALING
+  // WEB SOCKET
   // ------------------------------------------------------------
 
   if (request.method == 'GET' &&
@@ -429,10 +449,6 @@ Future<void> _handleSocket(
           message['type']
               ?.toString();
 
-      // ----------------------------------------------------------
-      // PRESENCE REGISTRATION
-      // ----------------------------------------------------------
-
       if (type ==
           'presence.register') {
         if (registration != null) {
@@ -465,10 +481,6 @@ Future<void> _handleSocket(
         continue;
       }
 
-      // ----------------------------------------------------------
-      // ALL OTHER COMMANDS REQUIRE AUTHENTICATED REGISTRATION
-      // ----------------------------------------------------------
-
       if (registration == null) {
         _send(
           socket,
@@ -484,10 +496,6 @@ Future<void> _handleSocket(
 
         continue;
       }
-
-      // ----------------------------------------------------------
-      // AUTHENTICATED TURN CREDENTIALS
-      // ----------------------------------------------------------
 
       if (type ==
           'turn.credentials.request') {
@@ -523,10 +531,6 @@ Future<void> _handleSocket(
         continue;
       }
 
-      // ----------------------------------------------------------
-      // APPLICATION KEEPALIVE
-      // ----------------------------------------------------------
-
       if (type ==
           'presence.heartbeat') {
         _send(
@@ -539,10 +543,6 @@ Future<void> _handleSocket(
 
         continue;
       }
-
-      // ----------------------------------------------------------
-      // TRANSIENT SIGNALING
-      // ----------------------------------------------------------
 
       if (type ==
           'signal.send') {
@@ -617,8 +617,7 @@ Future<_PendingSocketRegistration?>
               ?.toString() ??
           '';
 
-  if (!_catIdPattern
-      .hasMatch(catId)) {
+  if (!_isValidCatId(catId)) {
     _reject(
       socket,
       'Invalid CAT ID format',
@@ -743,8 +742,6 @@ Future<_PendingSocketRegistration?>
     return null;
   }
 
-  // Verify the displayed fingerprint rather than trusting
-  // arbitrary client-supplied text.
   final expectedFingerprint =
       _fingerprint(
     signingPublicKeyBytes,
@@ -761,7 +758,6 @@ Future<_PendingSocketRegistration?>
     return null;
   }
 
-  // Only one live session is permitted for the same CAT ID.
   final previous =
       _online[catId];
 
@@ -951,8 +947,7 @@ void _routeSignal(
   final rawPayload =
       message['payload'];
 
-  if (!_catIdPattern
-          .hasMatch(target) ||
+  if (!_isValidCatId(target) ||
       rawPayload is! Map) {
     _send(
       senderSocket,
@@ -972,7 +967,6 @@ void _routeSignal(
     rawPayload,
   );
 
-  // Keep signaling frames bounded.
   try {
     final payloadBytes =
         utf8.encode(
@@ -1049,6 +1043,65 @@ void _routeSignal(
           target,
     },
   );
+}
+
+/// Validates exactly:
+///
+/// CAT-XXXX-XXXX
+///
+/// Each X must be A-Z or 0-9 after uppercasing.
+bool _isValidCatId(
+  String catId,
+) {
+  if (catId.length != 13) {
+    return false;
+  }
+
+  if (catId.substring(0, 4) !=
+      'CAT-') {
+    return false;
+  }
+
+  if (catId.codeUnitAt(8) !=
+      45) {
+    return false;
+  }
+
+  for (int index = 4;
+      index < 8;
+      index++) {
+    if (!_isAlphaNumeric(
+      catId.codeUnitAt(index),
+    )) {
+      return false;
+    }
+  }
+
+  for (int index = 9;
+      index < 13;
+      index++) {
+    if (!_isAlphaNumeric(
+      catId.codeUnitAt(index),
+    )) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool _isAlphaNumeric(
+  int codeUnit,
+) {
+  final upper =
+      codeUnit >= 65 &&
+      codeUnit <= 90;
+
+  final digit =
+      codeUnit >= 48 &&
+      codeUnit <= 57;
+
+  return upper || digit;
 }
 
 String _fingerprint(
@@ -1148,10 +1201,13 @@ Future<Map<String, dynamic>?>
       utf8.decode(bytes),
     );
 
-    return decoded
-        is Map<String, dynamic>
-        ? decoded
-        : null;
+    if (decoded is Map) {
+      return Map<String, dynamic>.from(
+        decoded,
+      );
+    }
+
+    return null;
   } catch (_) {
     return null;
   }
@@ -1171,7 +1227,9 @@ void _respond(
       jsonEncode(body),
     );
 
-  request.response.close();
+  unawaited(
+    request.response.close(),
+  );
 }
 
 void _commonHeaders(
@@ -1220,10 +1278,13 @@ Map<String, dynamic>?
     final decoded =
         jsonDecode(body);
 
-    return decoded
-        is Map<String, dynamic>
-        ? decoded
-        : null;
+    if (decoded is Map) {
+      return Map<String, dynamic>.from(
+        decoded,
+      );
+    }
+
+    return null;
   } catch (_) {
     return null;
   }
