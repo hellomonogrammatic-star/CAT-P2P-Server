@@ -28,8 +28,7 @@ Future<void> main(
 ) async {
   final port =
       int.tryParse(
-            Platform.environment['PORT'] ??
-                '',
+            Platform.environment['PORT'] ?? '',
           ) ??
           int.tryParse(
             _argValue(
@@ -101,24 +100,15 @@ Future<void> main(
 }
 
 /// IMPORTANT:
-/// Each incoming HTTP/WebSocket request is handled in its own
-/// asynchronous task.
+/// Every incoming HTTP/WebSocket request is handled independently.
 ///
-/// We must NOT:
-///
-///   await _handle(request);
-///
-/// directly inside the HttpServer accept loop, because a WebSocket
-/// handler remains alive until that CAT disconnects. Awaiting it would
-/// prevent the server from processing other CATs.
-///
-/// This was the main bug causing one CAT to appear online while
-/// another CAT could not register.
+/// We must NOT await a long-lived WebSocket handler directly inside
+/// the HTTP accept loop. Otherwise one connected CAT can prevent
+/// other CATs from registering.
 Future<void> _serve(
   HttpServer server,
 ) async {
-  await for (final request
-      in server) {
+  await for (final request in server) {
     unawaited(
       _handleSafely(request),
     );
@@ -349,7 +339,7 @@ Future<void> _handle(
   }
 
   // ------------------------------------------------------------
-  // WEB SOCKET
+  // WEB SOCKET SIGNALING
   // ------------------------------------------------------------
 
   if (request.method == 'GET' &&
@@ -363,9 +353,6 @@ Future<void> _handle(
           await WebSocketTransformer
               .upgrade(request);
 
-      // This function may stay alive for the entire lifetime
-      // of this CAT. Because _serve() uses unawaited(), other
-      // CAT connections continue to work at the same time.
       await _handleSocket(
         socket,
       );
@@ -501,11 +488,7 @@ Future<void> _handleSocket(
       // ----------------------------------------------------------
       // AUTHENTICATED TURN CREDENTIALS
       // ----------------------------------------------------------
-      //
-      // TURN is only requested by a CAT that already completed
-      // the authenticated presence registration above. The
-      // long-lived Cloudflare TURN key never leaves this server.
-      // The app receives short-lived ICE server credentials only.
+
       if (type ==
           'turn.credentials.request') {
         try {
@@ -541,7 +524,7 @@ Future<void> _handleSocket(
       }
 
       // ----------------------------------------------------------
-      // OPTIONAL APPLICATION KEEPALIVE
+      // APPLICATION KEEPALIVE
       // ----------------------------------------------------------
 
       if (type ==
@@ -704,11 +687,9 @@ Future<_PendingSocketRegistration?>
     return null;
   }
 
-  if (signingPublicKeyBytes
-              .length !=
+  if (signingPublicKeyBytes.length !=
           32 ||
-      exchangePublicKeyBytes
-              .length !=
+      exchangePublicKeyBytes.length !=
           32 ||
       signatureBytes.length !=
           64) {
@@ -780,7 +761,7 @@ Future<_PendingSocketRegistration?>
     return null;
   }
 
-  // Only one live session is permitted for the SAME CAT ID.
+  // Only one live session is permitted for the same CAT ID.
   final previous =
       _online[catId];
 
@@ -831,38 +812,50 @@ Future<_PendingSocketRegistration?>
   );
 }
 
-Future<List<Map<String, dynamic>>> _generateTurnCredentials() async {
+Future<List<Map<String, dynamic>>>
+    _generateTurnCredentials() async {
   final keyId =
-      Platform.environment['CLOUDFLARE_TURN_KEY_ID']
+      Platform.environment[
+                  'CLOUDFLARE_TURN_KEY_ID']
               ?.trim() ??
           '';
 
   final apiToken =
-      Platform.environment['CLOUDFLARE_TURN_API_TOKEN']
+      Platform.environment[
+                  'CLOUDFLARE_TURN_API_TOKEN']
               ?.trim() ??
           '';
 
-  if (keyId.isEmpty || apiToken.isEmpty) {
+  if (keyId.isEmpty ||
+      apiToken.isEmpty) {
     throw StateError(
       'Cloudflare TURN server credentials are not configured',
     );
   }
 
-  final endpoint = Uri.parse(
+  final endpoint =
+      Uri.parse(
     'https://rtc.live.cloudflare.com/v1/turn/keys/'
     '$keyId/credentials/generate-ice-servers',
   );
 
-  final client = HttpClient();
+  final client =
+      HttpClient();
+
   client.connectionTimeout =
-      const Duration(seconds: 10);
+      const Duration(
+    seconds: 10,
+  );
 
   try {
     final request =
-        await client.postUrl(endpoint);
+        await client.postUrl(
+      endpoint,
+    );
 
     request.headers
-      ..contentType = ContentType.json
+      ..contentType =
+          ContentType.json
       ..set(
         HttpHeaders.authorizationHeader,
         'Bearer $apiToken',
@@ -881,15 +874,21 @@ Future<List<Map<String, dynamic>>> _generateTurnCredentials() async {
 
     final response =
         await request.close().timeout(
-      const Duration(seconds: 10),
+      const Duration(
+        seconds: 10,
+      ),
     );
 
     final body =
         await response
-            .transform(utf8.decoder)
+            .transform(
+              utf8.decoder,
+            )
             .join()
             .timeout(
-          const Duration(seconds: 10),
+          const Duration(
+            seconds: 10,
+          ),
         );
 
     final decoded =
@@ -912,10 +911,13 @@ Future<List<Map<String, dynamic>>> _generateTurnCredentials() async {
             .whereType<Map>()
             .map(
               (item) =>
-                  Map<String, dynamic>.from(item),
+                  Map<String, dynamic>.from(
+                item,
+              ),
             )
             .where(
-              (item) => item['urls'] != null,
+              (item) =>
+                  item['urls'] != null,
             )
             .toList();
 
@@ -966,8 +968,7 @@ void _routeSignal(
   }
 
   final payload =
-      Map<String, dynamic>
-          .from(
+      Map<String, dynamic>.from(
     rawPayload,
   );
 
@@ -1170,8 +1171,7 @@ void _respond(
       jsonEncode(body),
     );
 
-  request.response
-      .close();
+  request.response.close();
 }
 
 void _commonHeaders(
